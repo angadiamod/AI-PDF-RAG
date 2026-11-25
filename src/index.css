@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Markdown prose inside chat & summaries */
+.rag-prose p {
+  margin-bottom: 0.75rem;
+  line-height: 1.65;
+}
+.rag-prose p:last-child {
+  margin-bottom: 0;
+}
+.rag-prose ul,
+.rag-prose ol {
+  margin: 0.5rem 0 0.75rem 1.25rem;
+}
+.rag-prose ul {
+  list-style-type: disc;
+}
+.rag-prose ol {
+  list-style-type: decimal;
+}
+.rag-prose li {
+  margin-bottom: 0.35rem;
+  line-height: 1.6;
+}
+.rag-prose h1,
+.rag-prose h2,
+.rag-prose h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: #0f172a;
+  margin-top: 1rem;
+  margin-bottom: 0.4rem;
+}
+.rag-prose h3 {
+  font-size: 1rem;
+}
+.rag-prose strong {
+  font-weight: 600;
+  color: #0f172a;
+}
+.rag-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background-color: #eff6ff;
+  color: #1e3a8a;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.25rem;
+}
+.rag-prose pre {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  padding: 0.85rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+}
+.rag-prose pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+}
