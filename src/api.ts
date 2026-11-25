@@ -98,12 +98,26 @@ export const api = {
       });
 
       xhr.addEventListener('load', () => {
+        if (xhr.status === 413) {
+          reject(
+            new Error(
+              'This PDF exceeds the hosting platform request size limit (4.5 MB on Vercel). Try a smaller PDF or run locally for files up to 20 MB.'
+            )
+          );
+          return;
+        }
         try {
           const parsed = JSON.parse(xhr.responseText || '{}');
           if (xhr.status >= 200 && xhr.status < 300) {
             resolve(parsed);
           } else {
-            reject(new Error(parsed.error || parsed.results?.[0]?.error || `Upload failed (${xhr.status})`));
+            reject(
+              new Error(
+                parsed.error ||
+                  parsed.results?.[0]?.error ||
+                  `Upload failed (${xhr.status})`
+              )
+            );
           }
         } catch {
           reject(new Error(`Upload failed with status ${xhr.status}`));

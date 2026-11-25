@@ -1,8 +1,9 @@
-import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import type DatabaseType from 'better-sqlite3';
 import type {
   ChapterInfo,
   ChatMessage,
@@ -24,6 +25,12 @@ import type {
 import type { StoredEmbeddedChunk } from './rag';
 
 function resolveWritableDataDir(): string {
+  // Vercel serverless filesystems are read-only outside os.tmpdir() (/tmp)
+  if (process.env.VERCEL === '1') {
+    const tmpDir = path.join(os.tmpdir(), 'ai-pdf-rag-data');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    return tmpDir;
+  }
   const preferred = path.resolve(process.cwd(), 'data');
   try {
     fs.mkdirSync(preferred, { recursive: true });
@@ -40,92 +47,10 @@ const DATA_DIR = resolveWritableDataDir();
 export const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 export const SAMPLES_DIR = path.join(DATA_DIR, 'samples');
 const DB_PATH = path.join(DATA_DIR, 'rag.sqlite');
+const JSON_STORE_PATH = path.join(DATA_DIR, 'rag-store.json');
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(SAMPLES_DIR, { recursive: true });
-
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS documents (
-    id TEXT PRIMARY KEY,
-    filename TEXT NOT NULL,
-    original_name TEXT NOT NULL,
-    file_size INTEGER NOT NULL,
-    page_count INTEGER NOT NULL DEFAULT 0,
-    chunk_count INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'uploading',
-    error_message TEXT,
-    file_path TEXT NOT NULL,
-    chapters_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS chunks (
-    id TEXT PRIMARY KEY,
-    document_id TEXT NOT NULL,
-    document_name TEXT NOT NULL,
-    page_number INTEGER NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    char_count INTEGER NOT NULL,
-    embedding_json TEXT NOT NULL,
-    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
-
-  CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    document_ids_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    sources_json TEXT NOT NULL DEFAULT '[]',
-    found_in_docs INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
-
-  CREATE TABLE IF NOT EXISTS summaries (
-    id TEXT PRIMARY KEY,
-    document_id TEXT NOT NULL,
-    document_name TEXT NOT NULL,
-    mode TEXT NOT NULL,
-    chapter_title TEXT,
-    summary TEXT NOT NULL,
-    key_points_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS question_sets (
-    id TEXT PRIMARY KEY,
-    document_id TEXT NOT NULL,
-    document_name TEXT NOT NULL,
-    question_type TEXT NOT NULL,
-    difficulty TEXT NOT NULL,
-    questions_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-`);
 
 export const DEFAULT_SETTINGS: RagSettings = {
   chunkSize: 900,
@@ -145,8 +70,174 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
   }
 }
 
+// Attempt to load native better-sqlite3; if unavailable in a serverless runtime (e.g. Vercel),
+// seamlessly fall back to a pure-JS JSON file store inside DATA_DIR so the API never crashes.
+let sqliteDb: DatabaseType.Database | null = null;
+try {
+  const require = createRequire(import.meta.url);
+  const BetterSqlite3 = require('better-sqlite3') as typeof DatabaseType;
+  const instance = new BetterSqlite3(DB_PATH);
+  instance.pragma('journal_mode = WAL');
+  instance.pragma('foreign_keys = ON');
+  instance.exec(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id TEXT PRIMARY KEY,
+      filename TEXT NOT NULL,
+      original_name TEXT NOT NULL,
+      file_size INTEGER NOT NULL,
+      page_count INTEGER NOT NULL DEFAULT 0,
+      chunk_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'uploading',
+      error_message TEXT,
+      file_path TEXT NOT NULL,
+      chapters_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chunks (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL,
+      document_name TEXT NOT NULL,
+      page_number INTEGER NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      char_count INTEGER NOT NULL,
+      embedding_json TEXT NOT NULL,
+      FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
+
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      document_ids_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      found_in_docs INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+
+    CREATE TABLE IF NOT EXISTS summaries (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL,
+      document_name TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      chapter_title TEXT,
+      summary TEXT NOT NULL,
+      key_points_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS question_sets (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL,
+      document_name TEXT NOT NULL,
+      question_type TEXT NOT NULL,
+      difficulty TEXT NOT NULL,
+      questions_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  sqliteDb = instance;
+} catch {
+  sqliteDb = null;
+}
+
+// ---------- JSON Fallback Store (used only if better-sqlite3 native binary cannot load) ----------
+
+interface JsonDocRecord extends DocumentRecord {
+  filePath: string;
+}
+
+interface JsonChunkRecord extends StoredEmbeddedChunk {
+  charCount: number;
+}
+
+interface JsonStoreState {
+  documents: JsonDocRecord[];
+  chunks: JsonChunkRecord[];
+  conversations: Array<{
+    id: string;
+    title: string;
+    documentIds: string[];
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  messages: ChatMessage[];
+  summaries: SummaryRecord[];
+  questionSets: QuestionSetRecord[];
+  settings: RagSettings;
+}
+
+function emptyJsonState(): JsonStoreState {
+  return {
+    documents: [],
+    chunks: [],
+    conversations: [],
+    messages: [],
+    summaries: [],
+    questionSets: [],
+    settings: { ...DEFAULT_SETTINGS },
+  };
+}
+
+let memoryFallbackState: JsonStoreState | null = null;
+
+function readJsonStore(): JsonStoreState {
+  if (memoryFallbackState) return memoryFallbackState;
+  try {
+    if (fs.existsSync(JSON_STORE_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(JSON_STORE_PATH, 'utf8')) as Partial<JsonStoreState>;
+      memoryFallbackState = {
+        ...emptyJsonState(),
+        ...parsed,
+        settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+      };
+      return memoryFallbackState;
+    }
+  } catch {
+    // Ignore corrupt fallback file
+  }
+  memoryFallbackState = emptyJsonState();
+  return memoryFallbackState;
+}
+
+function writeJsonStore(state: JsonStoreState): void {
+  memoryFallbackState = state;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(JSON_STORE_PATH, JSON.stringify(state));
+  } catch {
+    // Keep in-memory state if disk write fails
+  }
+}
+
+// ---------- Settings ----------
+
 export function getSettings(): RagSettings {
-  const rows = db.prepare('SELECT key, value FROM settings').all() as Array<{
+  if (!sqliteDb) {
+    return { ...readJsonStore().settings };
+  }
+  const rows = sqliteDb.prepare('SELECT key, value FROM settings').all() as Array<{
     key: string;
     value: string;
   }>;
@@ -182,13 +273,23 @@ export function updateSettings(partial: Partial<RagSettings>): RagSettings {
       partial.responseStyle === 'detailed'
         ? partial.responseStyle
         : current.responseStyle,
-    maxFileSizeMb: Math.max(1, Math.min(50, Math.round(partial.maxFileSizeMb ?? current.maxFileSizeMb))),
+    maxFileSizeMb: Math.max(
+      1,
+      Math.min(50, Math.round(partial.maxFileSizeMb ?? current.maxFileSizeMb))
+    ),
   };
 
-  const upsert = db.prepare(
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.settings = merged;
+    writeJsonStore(state);
+    return merged;
+  }
+
+  const upsert = sqliteDb.prepare(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
   );
-  const tx = db.transaction((s: RagSettings) => {
+  const tx = sqliteDb.transaction((s: RagSettings) => {
     for (const [key, value] of Object.entries(s)) {
       upsert.run(key, String(value));
     }
@@ -196,6 +297,8 @@ export function updateSettings(partial: Partial<RagSettings>): RagSettings {
   tx(merged);
   return merged;
 }
+
+// ---------- Documents ----------
 
 interface DocumentRow {
   id: string;
@@ -226,6 +329,11 @@ function mapDocumentRow(row: DocumentRow): DocumentRecord {
   };
 }
 
+function stripFilePath(doc: JsonDocRecord): DocumentRecord {
+  const { filePath: _unused, ...rest } = doc;
+  return rest;
+}
+
 export function createDocumentRecord(input: {
   id?: string;
   filename: string;
@@ -236,18 +344,41 @@ export function createDocumentRecord(input: {
 }): DocumentRecord {
   const id = input.id ?? crypto.randomUUID();
   const createdAt = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO documents (id, filename, original_name, file_size, page_count, chunk_count, status, error_message, file_path, chapters_json, created_at)
-     VALUES (?, ?, ?, ?, 0, 0, ?, NULL, ?, '[]', ?)`
-  ).run(
-    id,
-    input.filename,
-    input.originalName,
-    input.fileSize,
-    input.status ?? 'uploading',
-    input.filePath,
-    createdAt
-  );
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const record: JsonDocRecord = {
+      id,
+      filename: input.filename,
+      originalName: input.originalName,
+      fileSize: input.fileSize,
+      pageCount: 0,
+      chunkCount: 0,
+      status: input.status ?? 'uploading',
+      errorMessage: null,
+      chapters: [],
+      createdAt,
+      filePath: input.filePath,
+    };
+    state.documents.unshift(record);
+    writeJsonStore(state);
+    return stripFilePath(record);
+  }
+
+  sqliteDb
+    .prepare(
+      `INSERT INTO documents (id, filename, original_name, file_size, page_count, chunk_count, status, error_message, file_path, chapters_json, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, NULL, ?, '[]', ?)`
+    )
+    .run(
+      id,
+      input.filename,
+      input.originalName,
+      input.fileSize,
+      input.status ?? 'uploading',
+      input.filePath,
+      createdAt
+    );
   return getDocumentById(id)!;
 }
 
@@ -261,42 +392,71 @@ export function updateDocumentState(
     chapters?: ChapterInfo[];
   }
 ): DocumentRecord | null {
-  const existing = db.prepare('SELECT * FROM documents WHERE id = ?').get(id) as
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const doc = state.documents.find((d) => d.id === id);
+    if (!doc) return null;
+    if (updates.status !== undefined) doc.status = updates.status;
+    if (updates.pageCount !== undefined) doc.pageCount = updates.pageCount;
+    if (updates.chunkCount !== undefined) doc.chunkCount = updates.chunkCount;
+    if (updates.errorMessage !== undefined) doc.errorMessage = updates.errorMessage;
+    if (updates.chapters !== undefined) doc.chapters = updates.chapters;
+    writeJsonStore(state);
+    return stripFilePath(doc);
+  }
+
+  const existing = sqliteDb.prepare('SELECT * FROM documents WHERE id = ?').get(id) as
     | DocumentRow
     | undefined;
   if (!existing) return null;
 
-  db.prepare(
-    `UPDATE documents
-     SET status = ?, page_count = ?, chunk_count = ?, error_message = ?, chapters_json = ?
-     WHERE id = ?`
-  ).run(
-    updates.status ?? existing.status,
-    updates.pageCount ?? existing.page_count,
-    updates.chunkCount ?? existing.chunk_count,
-    updates.errorMessage !== undefined ? updates.errorMessage : existing.error_message,
-    updates.chapters ? JSON.stringify(updates.chapters) : existing.chapters_json,
-    id
-  );
+  sqliteDb
+    .prepare(
+      `UPDATE documents
+       SET status = ?, page_count = ?, chunk_count = ?, error_message = ?, chapters_json = ?
+       WHERE id = ?`
+    )
+    .run(
+      updates.status ?? existing.status,
+      updates.pageCount ?? existing.page_count,
+      updates.chunkCount ?? existing.chunk_count,
+      updates.errorMessage !== undefined ? updates.errorMessage : existing.error_message,
+      updates.chapters ? JSON.stringify(updates.chapters) : existing.chapters_json,
+      id
+    );
   return getDocumentById(id);
 }
 
 export function listDocuments(): DocumentRecord[] {
-  const rows = db
+  if (!sqliteDb) {
+    return readJsonStore()
+      .documents.slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .map(stripFilePath);
+  }
+  const rows = sqliteDb
     .prepare('SELECT * FROM documents ORDER BY created_at DESC')
     .all() as DocumentRow[];
   return rows.map(mapDocumentRow);
 }
 
 export function getDocumentById(id: string): DocumentRecord | null {
-  const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(id) as
+  if (!sqliteDb) {
+    const found = readJsonStore().documents.find((d) => d.id === id);
+    return found ? stripFilePath(found) : null;
+  }
+  const row = sqliteDb.prepare('SELECT * FROM documents WHERE id = ?').get(id) as
     | DocumentRow
     | undefined;
   return row ? mapDocumentRow(row) : null;
 }
 
 export function getDocumentFilePath(id: string): { filePath: string; originalName: string } | null {
-  const row = db
+  if (!sqliteDb) {
+    const found = readJsonStore().documents.find((d) => d.id === id);
+    return found ? { filePath: found.filePath, originalName: found.originalName } : null;
+  }
+  const row = sqliteDb
     .prepare('SELECT file_path, original_name FROM documents WHERE id = ?')
     .get(id) as { file_path: string; original_name: string } | undefined;
   if (!row) return null;
@@ -305,7 +465,22 @@ export function getDocumentFilePath(id: string): { filePath: string; originalNam
 
 export function deleteDocument(id: string): boolean {
   const fileInfo = getDocumentFilePath(id);
-  const res = db.prepare('DELETE FROM documents WHERE id = ?').run(id);
+  let deleted = false;
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const before = state.documents.length;
+    state.documents = state.documents.filter((d) => d.id !== id);
+    state.chunks = state.chunks.filter((c) => c.documentId !== id);
+    state.summaries = state.summaries.filter((s) => s.documentId !== id);
+    state.questionSets = state.questionSets.filter((q) => q.documentId !== id);
+    deleted = state.documents.length < before;
+    if (deleted) writeJsonStore(state);
+  } else {
+    const res = sqliteDb.prepare('DELETE FROM documents WHERE id = ?').run(id);
+    deleted = res.changes > 0;
+  }
+
   if (fileInfo && fs.existsSync(fileInfo.filePath)) {
     try {
       fs.unlinkSync(fileInfo.filePath);
@@ -313,8 +488,10 @@ export function deleteDocument(id: string): boolean {
       // Ignore cleanup failures
     }
   }
-  return res.changes > 0;
+  return deleted;
 }
+
+// ---------- Chunks ----------
 
 export function replaceDocumentChunks(
   documentId: string,
@@ -328,12 +505,25 @@ export function replaceDocumentChunks(
     embedding: number[];
   }>
 ): void {
-  const del = db.prepare('DELETE FROM chunks WHERE document_id = ?');
-  const ins = db.prepare(
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.chunks = state.chunks.filter((c) => c.documentId !== documentId);
+    for (const chunk of chunks) {
+      state.chunks.push({
+        id: crypto.randomUUID(),
+        ...chunk,
+      });
+    }
+    writeJsonStore(state);
+    return;
+  }
+
+  const del = sqliteDb.prepare('DELETE FROM chunks WHERE document_id = ?');
+  const ins = sqliteDb.prepare(
     `INSERT INTO chunks (id, document_id, document_name, page_number, chunk_index, content, char_count, embedding_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  const tx = db.transaction(() => {
+  const tx = sqliteDb.transaction(() => {
     del.run(documentId);
     for (const chunk of chunks) {
       ins.run(
@@ -352,7 +542,14 @@ export function replaceDocumentChunks(
 }
 
 export function getDocumentChunks(documentId: string): ChunkRecord[] {
-  const rows = db
+  if (!sqliteDb) {
+    return readJsonStore()
+      .chunks.filter((c) => c.documentId === documentId)
+      .sort((a, b) => a.chunkIndex - b.chunkIndex)
+      .map(({ embedding: _unused, ...rest }) => rest);
+  }
+
+  const rows = sqliteDb
     .prepare(
       `SELECT id, document_id, document_name, page_number, chunk_index, content, char_count
        FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC`
@@ -379,6 +576,17 @@ export function getDocumentChunks(documentId: string): ChunkRecord[] {
 }
 
 export function getAllEmbeddedChunks(documentIds?: string[]): StoredEmbeddedChunk[] {
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const readyIds = new Set(
+      state.documents.filter((d) => d.status === 'ready').map((d) => d.id)
+    );
+    const filterSet = documentIds && documentIds.length > 0 ? new Set(documentIds) : null;
+    return state.chunks.filter(
+      (c) => readyIds.has(c.documentId) && (!filterSet || filterSet.has(c.documentId))
+    );
+  }
+
   let rows: Array<{
     id: string;
     document_id: string;
@@ -391,7 +599,7 @@ export function getAllEmbeddedChunks(documentIds?: string[]): StoredEmbeddedChun
 
   if (documentIds && documentIds.length > 0) {
     const placeholders = documentIds.map(() => '?').join(',');
-    rows = db
+    rows = sqliteDb
       .prepare(
         `SELECT c.id, c.document_id, c.document_name, c.page_number, c.chunk_index, c.content, c.embedding_json
          FROM chunks c
@@ -400,7 +608,7 @@ export function getAllEmbeddedChunks(documentIds?: string[]): StoredEmbeddedChun
       )
       .all(...documentIds) as typeof rows;
   } else {
-    rows = db
+    rows = sqliteDb
       .prepare(
         `SELECT c.id, c.document_id, c.document_name, c.page_number, c.chunk_index, c.content, c.embedding_json
          FROM chunks c
@@ -421,13 +629,33 @@ export function getAllEmbeddedChunks(documentIds?: string[]): StoredEmbeddedChun
   }));
 }
 
+// ---------- Conversations & Messages ----------
+
 export function createConversation(title: string, documentIds: string[] = []): ConversationRecord {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO conversations (id, title, document_ids_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(id, title, JSON.stringify(documentIds), now, now);
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.conversations.unshift({ id, title, documentIds, createdAt: now, updatedAt: now });
+    writeJsonStore(state);
+    return {
+      id,
+      title,
+      documentIds,
+      messageCount: 0,
+      lastMessagePreview: '',
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  sqliteDb
+    .prepare(
+      `INSERT INTO conversations (id, title, document_ids_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(id, title, JSON.stringify(documentIds), now, now);
 
   return {
     id,
@@ -444,23 +672,54 @@ export function updateConversationMeta(
   id: string,
   updates: { title?: string; documentIds?: string[] }
 ): void {
-  const existing = db.prepare('SELECT * FROM conversations WHERE id = ?').get(id) as
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const conv = state.conversations.find((c) => c.id === id);
+    if (!conv) return;
+    if (updates.title !== undefined) conv.title = updates.title;
+    if (updates.documentIds !== undefined) conv.documentIds = updates.documentIds;
+    conv.updatedAt = new Date().toISOString();
+    writeJsonStore(state);
+    return;
+  }
+
+  const existing = sqliteDb.prepare('SELECT * FROM conversations WHERE id = ?').get(id) as
     | { id: string; title: string; document_ids_json: string }
     | undefined;
   if (!existing) return;
 
-  db.prepare(
-    `UPDATE conversations SET title = ?, document_ids_json = ?, updated_at = ? WHERE id = ?`
-  ).run(
-    updates.title ?? existing.title,
-    updates.documentIds ? JSON.stringify(updates.documentIds) : existing.document_ids_json,
-    new Date().toISOString(),
-    id
-  );
+  sqliteDb
+    .prepare(
+      `UPDATE conversations SET title = ?, document_ids_json = ?, updated_at = ? WHERE id = ?`
+    )
+    .run(
+      updates.title ?? existing.title,
+      updates.documentIds ? JSON.stringify(updates.documentIds) : existing.document_ids_json,
+      new Date().toISOString(),
+      id
+    );
 }
 
 export function listConversations(): ConversationRecord[] {
-  const rows = db
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    return state.conversations
+      .slice()
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .map((c) => {
+        const msgs = state.messages
+          .filter((m) => m.conversationId === c.id)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        return {
+          ...c,
+          messageCount: msgs.length,
+          lastMessagePreview:
+            msgs.length > 0 ? msgs[msgs.length - 1].content.slice(0, 140) : '',
+        };
+      });
+  }
+
+  const rows = sqliteDb
     .prepare(
       `SELECT
         c.id,
@@ -495,7 +754,23 @@ export function listConversations(): ConversationRecord[] {
 }
 
 export function getConversationDetail(id: string): ConversationDetail | null {
-  const row = db.prepare('SELECT * FROM conversations WHERE id = ?').get(id) as
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const conv = state.conversations.find((c) => c.id === id);
+    if (!conv) return null;
+    const messages = state.messages
+      .filter((m) => m.conversationId === id)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      ...conv,
+      messageCount: messages.length,
+      lastMessagePreview:
+        messages.length > 0 ? messages[messages.length - 1].content.slice(0, 140) : '',
+      messages,
+    };
+  }
+
+  const row = sqliteDb.prepare('SELECT * FROM conversations WHERE id = ?').get(id) as
     | {
         id: string;
         title: string;
@@ -506,7 +781,7 @@ export function getConversationDetail(id: string): ConversationDetail | null {
     | undefined;
   if (!row) return null;
 
-  const msgRows = db
+  const msgRows = sqliteDb
     .prepare(
       `SELECT id, conversation_id, role, content, sources_json, found_in_docs, created_at
        FROM messages WHERE conversation_id = ? ORDER BY created_at ASC`
@@ -536,7 +811,8 @@ export function getConversationDetail(id: string): ConversationDetail | null {
     title: row.title,
     documentIds: safeJsonParse<string[]>(row.document_ids_json, []),
     messageCount: messages.length,
-    lastMessagePreview: messages.length > 0 ? messages[messages.length - 1].content.slice(0, 140) : '',
+    lastMessagePreview:
+      messages.length > 0 ? messages[messages.length - 1].content.slice(0, 140) : '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     messages,
@@ -555,25 +831,7 @@ export function addChatMessage(input: {
   const sources = input.sources ?? [];
   const foundInDocs = input.foundInDocs ?? true;
 
-  db.prepare(
-    `INSERT INTO messages (id, conversation_id, role, content, sources_json, found_in_docs, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    input.conversationId,
-    input.role,
-    input.content,
-    JSON.stringify(sources),
-    foundInDocs ? 1 : 0,
-    createdAt
-  );
-
-  db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run(
-    createdAt,
-    input.conversationId
-  );
-
-  return {
+  const msg: ChatMessage = {
     id,
     conversationId: input.conversationId,
     role: input.role,
@@ -582,17 +840,66 @@ export function addChatMessage(input: {
     foundInDocs,
     createdAt,
   };
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.messages.push(msg);
+    const conv = state.conversations.find((c) => c.id === input.conversationId);
+    if (conv) conv.updatedAt = createdAt;
+    writeJsonStore(state);
+    return msg;
+  }
+
+  sqliteDb
+    .prepare(
+      `INSERT INTO messages (id, conversation_id, role, content, sources_json, found_in_docs, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      id,
+      input.conversationId,
+      input.role,
+      input.content,
+      JSON.stringify(sources),
+      foundInDocs ? 1 : 0,
+      createdAt
+    );
+
+  sqliteDb
+    .prepare('UPDATE conversations SET updated_at = ? WHERE id = ?')
+    .run(createdAt, input.conversationId);
+
+  return msg;
 }
 
 export function deleteConversation(id: string): boolean {
-  const res = db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const before = state.conversations.length;
+    state.conversations = state.conversations.filter((c) => c.id !== id);
+    state.messages = state.messages.filter((m) => m.conversationId !== id);
+    const deleted = state.conversations.length < before;
+    if (deleted) writeJsonStore(state);
+    return deleted;
+  }
+  const res = sqliteDb.prepare('DELETE FROM conversations WHERE id = ?').run(id);
   return res.changes > 0;
 }
 
 export function clearAllConversations(): number {
-  const res = db.prepare('DELETE FROM conversations').run();
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    const count = state.conversations.length;
+    state.conversations = [];
+    state.messages = [];
+    writeJsonStore(state);
+    return count;
+  }
+  const res = sqliteDb.prepare('DELETE FROM conversations').run();
   return res.changes;
 }
+
+// ---------- Summaries ----------
 
 export function saveSummary(input: {
   documentId: string;
@@ -604,21 +911,7 @@ export function saveSummary(input: {
 }): SummaryRecord {
   const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO summaries (id, document_id, document_name, mode, chapter_title, summary, key_points_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    input.documentId,
-    input.documentName,
-    input.mode,
-    input.chapterTitle,
-    input.summary,
-    JSON.stringify(input.keyPoints),
-    createdAt
-  );
-
-  return {
+  const record: SummaryRecord = {
     id,
     documentId: input.documentId,
     documentName: input.documentName,
@@ -628,10 +921,41 @@ export function saveSummary(input: {
     keyPoints: input.keyPoints,
     createdAt,
   };
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.summaries.unshift(record);
+    writeJsonStore(state);
+    return record;
+  }
+
+  sqliteDb
+    .prepare(
+      `INSERT INTO summaries (id, document_id, document_name, mode, chapter_title, summary, key_points_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      id,
+      input.documentId,
+      input.documentName,
+      input.mode,
+      input.chapterTitle,
+      input.summary,
+      JSON.stringify(input.keyPoints),
+      createdAt
+    );
+
+  return record;
 }
 
 export function listSummaries(): SummaryRecord[] {
-  const rows = db
+  if (!sqliteDb) {
+    return readJsonStore()
+      .summaries.slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 30);
+  }
+  const rows = sqliteDb
     .prepare('SELECT * FROM summaries ORDER BY created_at DESC LIMIT 30')
     .all() as Array<{
     id: string;
@@ -656,6 +980,8 @@ export function listSummaries(): SummaryRecord[] {
   }));
 }
 
+// ---------- Question Sets ----------
+
 export function saveQuestionSet(input: {
   documentId: string;
   documentName: string;
@@ -665,20 +991,7 @@ export function saveQuestionSet(input: {
 }): QuestionSetRecord {
   const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO question_sets (id, document_id, document_name, question_type, difficulty, questions_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    input.documentId,
-    input.documentName,
-    input.questionType,
-    input.difficulty,
-    JSON.stringify(input.questions),
-    createdAt
-  );
-
-  return {
+  const record: QuestionSetRecord = {
     id,
     documentId: input.documentId,
     documentName: input.documentName,
@@ -687,10 +1000,40 @@ export function saveQuestionSet(input: {
     questions: input.questions,
     createdAt,
   };
+
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    state.questionSets.unshift(record);
+    writeJsonStore(state);
+    return record;
+  }
+
+  sqliteDb
+    .prepare(
+      `INSERT INTO question_sets (id, document_id, document_name, question_type, difficulty, questions_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      id,
+      input.documentId,
+      input.documentName,
+      input.questionType,
+      input.difficulty,
+      JSON.stringify(input.questions),
+      createdAt
+    );
+
+  return record;
 }
 
 export function listQuestionSets(): QuestionSetRecord[] {
-  const rows = db
+  if (!sqliteDb) {
+    return readJsonStore()
+      .questionSets.slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 30);
+  }
+  const rows = sqliteDb
     .prepare('SELECT * FROM question_sets ORDER BY created_at DESC LIMIT 30')
     .all() as Array<{
     id: string;
@@ -713,6 +1056,8 @@ export function listQuestionSets(): QuestionSetRecord[] {
   }));
 }
 
+// ---------- Dashboard ----------
+
 export function getDashboardStats(): DashboardStats {
   const docs = listDocuments();
   const totalUploadedPdfs = docs.length;
@@ -726,19 +1071,36 @@ export function getDashboardStats(): DashboardStats {
   ).length;
   const totalFailedDocuments = docs.filter((d) => d.status === 'error').length;
 
-  const chunkCountRow = db.prepare('SELECT COUNT(*) AS count FROM chunks').get() as {
+  if (!sqliteDb) {
+    const state = readJsonStore();
+    return {
+      totalUploadedPdfs,
+      totalProcessedDocuments,
+      totalProcessingDocuments,
+      totalFailedDocuments,
+      totalChunksIndexed: state.chunks.length,
+      totalQuestionsAsked: state.messages.filter((m) => m.role === 'user').length,
+      totalConversations: state.conversations.length,
+      totalSummariesGenerated: state.summaries.length,
+      totalQuestionSetsGenerated: state.questionSets.length,
+      recentConversations: listConversations().slice(0, 5),
+      documents: docs,
+    };
+  }
+
+  const chunkCountRow = sqliteDb.prepare('SELECT COUNT(*) AS count FROM chunks').get() as {
     count: number;
   };
-  const questionCountRow = db
+  const questionCountRow = sqliteDb
     .prepare("SELECT COUNT(*) AS count FROM messages WHERE role = 'user'")
     .get() as { count: number };
-  const convCountRow = db.prepare('SELECT COUNT(*) AS count FROM conversations').get() as {
+  const convCountRow = sqliteDb.prepare('SELECT COUNT(*) AS count FROM conversations').get() as {
     count: number;
   };
-  const summaryCountRow = db.prepare('SELECT COUNT(*) AS count FROM summaries').get() as {
+  const summaryCountRow = sqliteDb.prepare('SELECT COUNT(*) AS count FROM summaries').get() as {
     count: number;
   };
-  const qSetCountRow = db.prepare('SELECT COUNT(*) AS count FROM question_sets').get() as {
+  const qSetCountRow = sqliteDb.prepare('SELECT COUNT(*) AS count FROM question_sets').get() as {
     count: number;
   };
 
